@@ -76,7 +76,7 @@ details p{margin:.5em 0}
 
   <section class="gauge" id="triBox">
     <div class="verdict" style="font-size:18px;color:var(--fg)">Triangulation (boussole + pas)</div>
-    <p class="sub" id="triStep" style="margin:8px 0">Choisis un appareil dans la liste, puis appuie sur « Tour au point A ».</p>
+    <p class="sub" id="triStep" style="margin:8px 0">Lance le scan, puis appuie sur « Tour au point A ». Tous les appareils sont triangulés.</p>
     <div class="row">
       <button id="triA">Tour au point A</button>
       <button id="triB" class="secondary" disabled>Tour au point B</button>
@@ -235,7 +235,7 @@ function renderList(){
     left.append(n,t);
     const r = document.createElement('span'); r.className = 'r'; r.textContent = Math.round(avg(d)) + ' dBm';
     li.append(left, r);
-    li.onclick = () => { selected = id; history = []; updateGauge(d); renderList(); };
+    li.onclick = () => { selected = id; history = []; updateGauge(d); renderList(); drawTri(); };
     ul.append(li);
   });
   if (selected && !arr.some(([id]) => id === selected) && devices.get(selected) && now - devices.get(selected).last > 10000){
@@ -284,19 +284,22 @@ function latestRssi(){
 }
 
 function startRot(which){
-  if (!selected){ $('triStep').textContent = 'Choisis d’abord un appareil dans la liste.'; return; }
+  if (!scan || !devices.size){ $('triStep').textContent = 'Lance d’abord le scan Bluetooth.'; return; }
   if (heading == null){ $('triStep').textContent = 'Boussole indisponible : bouge le téléphone en 8 pour la calibrer, puis réessaie.'; return; }
-  tri.rec = []; tri.turned = 0; tri.prevH = heading; tri.t0 = Date.now();
+  tri.rec = {}; tri.turned = 0; tri.prevH = heading; tri.t0 = Date.now();
   tri.phase = which === 'A' ? 'rotA' : 'rotB';
-  $('triStep').textContent = 'Téléphone à plat contre la poitrine, haut vers l’avant. Tourne lentement sur toi-même, un tour complet (~20 s).';
+  $('triStep').textContent = 'Téléphone à plat contre la poitrine, haut vers l’avant. Tourne lentement sur toi-même, un tour complet (~20 s). Tous les appareils sont relevés en même temps.';
 }
 
 function recordRot(){
   let dh = heading - tri.prevH; if (dh > 180) dh -= 360; if (dh < -180) dh += 360;
   tri.turned += Math.abs(dh); tri.prevH = heading;
-  const v = latestRssi(); if (v != null) tri.rec.push({h:heading, v});
+  const now = Date.now();
+  devices.forEach((d, id) => {
+    if (now - d.last < 1500 && d.samples.length) (tri.rec[id] = tri.rec[id] || []).push({h:heading, v:d.samples[d.samples.length-1]});
+  });
   $('triOut').textContent = `${Math.round(Math.min(360, tri.turned))}° / 360°`;
-  if (tri.turned >= 340 || Date.now() - tri.t0 > 45000) finishRot();
+  if (tri.turned >= 340 || now - tri.t0 > 45000) finishRot();
 }
 
 function bearingFrom(rec){
@@ -315,24 +318,25 @@ function bearingFrom(rec){
 }
 
 function finishRot(){
-  const b = bearingFrom(tri.rec), which = tri.phase === 'rotA' ? 'A' : 'B';
-  if (!b){ tri.phase = which === 'A' ? 'idle' : 'walk';
-    $('triStep').textContent = 'Pas assez de mesures pendant le tour (signal trop intermittent). Recommence plus lentement.'; return; }
-  const weak = b.contrast < 5 ? ' Attention : écart de signal faible, direction peu sûre.' : '';
+  const which = tri.phase === 'rotA' ? 'A' : 'B', bs = {};
+  Object.entries(tri.rec).forEach(([id, rec]) => { const b = bearingFrom(rec); if (b) bs[id] = b; });
+  const nb = Object.keys(bs).length;
+  if (!nb){ tri.phase = which === 'A' ? 'idle' : 'walk';
+    $('triStep').textContent = 'Pas assez de mesures pendant le tour (signaux trop intermittents). Recommence plus lentement.'; return; }
   if (which === 'A'){
-    tri.A = {x:me2.x, y:me2.y, deg:b.deg};
+    tri.A = {x:me2.x, y:me2.y, b:bs};
     walkSteps = 0; walkVec = {x:0,y:0}; $('triDist').value = 0; $('triSteps').textContent = '';
     tri.phase = 'walk'; $('triB').disabled = false;
-    $('triOut').textContent = `A : vers le ${dirName(b.deg)}`;
-    $('triStep').textContent = `Marche 4 à 6 m de côté (perpendiculaire à cette direction), puis « Tour au point B ».${weak}`;
+    $('triOut').textContent = `A : ${nb} appareil${nb>1?'s':''} relevé${nb>1?'s':''}`;
+    $('triStep').textContent = 'Marche 4 à 6 m de côté, puis « Tour au point B ».';
   } else {
     let vx = walkVec.x, vy = walkVec.y, L = Math.hypot(vx, vy);
     const want = parseFloat($('triDist').value) || 0;
     if (L < 0.1 && want > 0){ vx = Math.sin(heading*Math.PI/180); vy = Math.cos(heading*Math.PI/180); L = 1; }
     const k = want > 0 ? want / L : 1;
     me2 = {x: tri.A.x + vx*k, y: tri.A.y + vy*k};
-    tri.B = {x:me2.x, y:me2.y, deg:b.deg};
-    tri.phase = 'done'; tri.weak = weak;
+    tri.B = {x:me2.x, y:me2.y, b:bs};
+    tri.phase = 'done';
     solveTri();
   }
   drawTri();
@@ -341,47 +345,59 @@ function finishRot(){
 function solveTri(){
   const u = d => ({x:Math.sin(d*Math.PI/180), y:Math.cos(d*Math.PI/180)});
   const cr = (a,b) => a.x*b.y - a.y*b.x;
-  const uA = u(tri.A.deg), uB = u(tri.B.deg), AB = {x:tri.B.x-tri.A.x, y:tri.B.y-tri.A.y};
-  const den = cr(uA, uB);
-  tri.P = null;
-  if (Math.abs(den) < Math.sin(15*Math.PI/180)){
-    $('triStep').textContent = 'Les deux directions sont presque parallèles : déplace-toi davantage sur le côté et refais le point B.'; return;
-  }
-  const t = cr(AB, uB)/den, s = cr(AB, uA)/den;
-  if (t < 0 || s < 0){
-    $('triStep').textContent = 'Les deux directions ne se croisent pas devant toi : une mesure est fausse. Refais le tour B (ou recommence).'; return;
-  }
-  tri.P = {x: tri.A.x + uA.x*t, y: tri.A.y + uA.y*t};
-  $('triStep').textContent = 'Position estimée calculée. Suis l’indication, elle se met à jour quand tu tournes et marches.' + tri.weak;
+  const AB = {x:tri.B.x-tri.A.x, y:tri.B.y-tri.A.y};
+  tri.P = {}; let ok = 0, rej = 0;
+  Object.keys(tri.A.b).forEach(id => {
+    if (!tri.B.b[id]) return;
+    const uA = u(tri.A.b[id].deg), uB = u(tri.B.b[id].deg), den = cr(uA, uB);
+    if (Math.abs(den) < Math.sin(15*Math.PI/180)){ rej++; return; }
+    const t = cr(AB, uB)/den, s = cr(AB, uA)/den;
+    if (t < 0 || s < 0 || t > 60){ rej++; return; }
+    tri.P[id] = {x: tri.A.x + uA.x*t, y: tri.A.y + uA.y*t,
+      weak: Math.min(tri.A.b[id].contrast, tri.B.b[id].contrast) < 5};
+    ok++;
+  });
+  $('triStep').textContent = ok
+    ? `${ok} appareil${ok>1?'s':''} placé${ok>1?'s':''} sur la carte, ${rej} écarté${rej>1?'s':''} (directions incohérentes). Touche un appareil dans la liste pour être guidé. Points pâles = direction peu sûre.`
+    : 'Aucun appareil n’a pu être placé : directions parallèles ou incohérentes. Déplace-toi davantage sur le côté et refais le point B.';
 }
 
+const shortName = id => { const d = devices.get(id); return (d && d.name) ? d.name.slice(0,14) : id.slice(0,5); };
+
 function drawTri(){
-  const out = $('triOut');
-  if (tri.phase === 'done' && tri.P && heading != null){
-    const dx = tri.P.x - me2.x, dy = tri.P.y - me2.y, h = heading*Math.PI/180;
-    const fwd = dx*Math.sin(h) + dy*Math.cos(h), right = dx*Math.cos(h) - dy*Math.sin(h);
-    const f = Math.round(Math.abs(fwd)), r = Math.round(Math.abs(right));
-    out.textContent = Math.hypot(dx,dy) < 1.5 ? 'Tu y es : chaud/froid !' :
-      `${f} m ${fwd >= 0 ? 'devant' : 'derrière'} · ${r} m à ${right >= 0 ? 'droite' : 'gauche'}`;
+  const out = $('triOut'), P0 = tri.P && selected ? tri.P[selected] : null;
+  if (tri.phase === 'done'){
+    if (P0 && heading != null){
+      const dx = P0.x - me2.x, dy = P0.y - me2.y, h = heading*Math.PI/180;
+      const fwd = dx*Math.sin(h) + dy*Math.cos(h), right = dx*Math.cos(h) - dy*Math.sin(h);
+      out.textContent = Math.hypot(dx,dy) < 1.5 ? 'Tu y es : chaud/froid !' :
+        `${Math.round(Math.abs(fwd))} m ${fwd >= 0 ? 'devant' : 'derrière'} · ${Math.round(Math.abs(right))} m à ${right >= 0 ? 'droite' : 'gauche'}`;
+    } else out.textContent = selected ? 'Appareil choisi non placé' : 'Choisis un appareil';
   }
   const c = $('triMap'), rr = devicePixelRatio || 1;
   c.width = c.clientWidth*rr; c.height = c.clientHeight*rr;
   const g = c.getContext('2d'), w = c.width, hh = c.height, css = getComputedStyle(document.documentElement);
   g.clearRect(0,0,w,hh);
   if (!tri.A) return;
-  const pts = [tri.A, me2]; if (tri.B) pts.push(tri.B); if (tri.P) pts.push(tri.P);
+  const pts = [tri.A, me2]; if (tri.B) pts.push(tri.B); if (tri.P) pts.push(...Object.values(tri.P));
   const xs = pts.map(p=>p.x), ys = pts.map(p=>p.y);
-  const span = Math.max(10, Math.max(...xs)-Math.min(...xs), Math.max(...ys)-Math.min(...ys))*1.3;
+  const span = Math.max(10, Math.max(...xs)-Math.min(...xs), Math.max(...ys)-Math.min(...ys))*1.25;
   const cx = (Math.max(...xs)+Math.min(...xs))/2, cy = (Math.max(...ys)+Math.min(...ys))/2;
   const s = Math.min(w,hh)/span, P = q => [w/2+(q.x-cx)*s, hh/2-(q.y-cy)*s];
-  const ray = (o, col) => { const [x,y] = P(o), L = span*s;
+  const ray = (o, deg, col) => { const [x,y] = P(o), L = span*s;
     g.strokeStyle = col; g.lineWidth = 2*rr; g.setLineDash([6*rr,4*rr]); g.beginPath(); g.moveTo(x,y);
-    g.lineTo(x + Math.sin(o.deg*Math.PI/180)*L, y - Math.cos(o.deg*Math.PI/180)*L); g.stroke(); g.setLineDash([]); };
-  const dot = (o, col, label) => { const [x,y] = P(o); g.fillStyle = col; g.beginPath(); g.arc(x,y,6*rr,0,7); g.fill();
-    g.font = `${12*rr}px sans-serif`; g.fillText(label, x+9*rr, y-9*rr); };
-  ray(tri.A, css.getPropertyValue('--cold')); dot(tri.A, css.getPropertyValue('--cold'), 'A');
-  if (tri.B){ ray(tri.B, css.getPropertyValue('--warm')); dot(tri.B, css.getPropertyValue('--warm'), 'B'); }
-  if (tri.P) dot(tri.P, css.getPropertyValue('--hot'), 'AirPod ?');
+    g.lineTo(x + Math.sin(deg*Math.PI/180)*L, y - Math.cos(deg*Math.PI/180)*L); g.stroke(); g.setLineDash([]); };
+  const dot = (o, col, label, rad, alpha) => { const [x,y] = P(o); g.globalAlpha = alpha || 1; g.fillStyle = col;
+    g.beginPath(); g.arc(x,y,(rad||6)*rr,0,7); g.fill(); g.font = `${11*rr}px sans-serif`; g.fillText(label, x+8*rr, y-8*rr); g.globalAlpha = 1; };
+  if (selected && tri.A.b[selected]) ray(tri.A, tri.A.b[selected].deg, css.getPropertyValue('--cold'));
+  if (selected && tri.B && tri.B.b[selected]) ray(tri.B, tri.B.b[selected].deg, css.getPropertyValue('--warm'));
+  dot(tri.A, css.getPropertyValue('--cold'), 'A');
+  if (tri.B) dot(tri.B, css.getPropertyValue('--warm'), 'B');
+  if (tri.P) Object.entries(tri.P).forEach(([id,p]) => {
+    if (id === selected) return;
+    dot(p, css.getPropertyValue('--muted'), shortName(id), 4, p.weak ? 0.4 : 1);
+  });
+  if (P0) dot(P0, css.getPropertyValue('--hot'), shortName(selected), 8);
   dot(me2, css.getPropertyValue('--fg'), 'toi');
   g.fillStyle = css.getPropertyValue('--muted'); g.font = `${11*rr}px monospace`; g.fillText('N ↑', w-36*rr, 16*rr);
 }
@@ -390,7 +406,7 @@ $('triA').onclick = () => tri.phase === 'rotA' ? finishRot() : startRot('A');
 $('triB').onclick = () => tri.phase === 'rotB' ? finishRot() : startRot('B');
 $('triReset').onclick = () => { tri = {phase:'idle'}; me2 = {x:0,y:0}; walkSteps = 0; walkVec = {x:0,y:0};
   $('triB').disabled = true; $('triOut').textContent = '--'; $('triDist').value = 0; $('triSteps').textContent = '';
-  $('triStep').textContent = 'Choisis un appareil dans la liste, puis appuie sur « Tour au point A ».'; drawTri(); };
+  $('triStep').textContent = 'Lance le scan, puis appuie sur « Tour au point A ». Tous les appareils sont triangulés.'; drawTri(); };
 
 /* ---- Carte extérieure : GPS + signal ---- */
 let gpsWatch = null, here = null, pts = [];
