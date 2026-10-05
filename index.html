@@ -104,6 +104,7 @@ details p{margin:.5em 0}
   </div>
 
   <ul id="list"></ul>
+  <button id="wipe" class="secondary">Tout effacer (appareils et mesures)</button>
 
   <details>
     <summary>Comment ça marche et limites</summary>
@@ -144,6 +145,7 @@ $('start').onclick = async () => {
     navigator.bluetooth.addEventListener('advertisementreceived', onAdv);
     $('msg').hidden = true; $('start').hidden = true; $('stop').hidden = false;
     $('verdict').textContent = 'Scan en cours…';
+    keepAwake();
   }catch(e){
     showMsg("Le scan n'a pas démarré : " + e.message + "<br>Vérifie que le Bluetooth et la localisation du téléphone sont activés, puis accepte la demande de Chrome.");
   }
@@ -216,32 +218,80 @@ function maybeBeep(v){
 
 function renderList(){
   const now = Date.now(), appleOnly = $('appleOnly').checked;
+  const fresh = d => now - d.last < 10000;
   const arr = [...devices.entries()]
-    .filter(([,d]) => now - d.last < 10000 && (!appleOnly || d.apple))
-    .sort((a,b) => (avg(b[1])??-200) - (avg(a[1])??-200));
+    .filter(([,d]) => !appleOnly || d.apple)
+    .sort((a,b) => (fresh(b[1]) - fresh(a[1])) || ((avg(b[1])??-200) - (avg(a[1])??-200)));
   const ul = $('list'); ul.innerHTML = '';
   if (!arr.length && scan){
     const li = document.createElement('li'); li.style.cursor = 'default';
-    li.innerHTML = '<span class="t">Aucun appareil détecté pour l’instant…</span>'; ul.append(li);
+    li.innerHTML = '<span class="t">Aucun appareil détecté pour l\u2019instant…</span>'; ul.append(li);
   }
   arr.forEach(([id,d]) => {
     const li = document.createElement('li'); if (id === selected) li.classList.add('sel');
+    if (!fresh(d)) li.style.opacity = '0.55';
     const left = document.createElement('div'); left.style.minWidth = '0';
     const n = document.createElement('div'); n.className = 'n';
     n.textContent = d.name || 'Appareil sans nom';
     if (d.apple){ const t = document.createElement('span'); t.className='tag'; t.textContent='Apple'; n.append(t); }
-    const t = document.createElement('div'); t.className = 't'; t.textContent = id.slice(0,10) + '…';
+    const nObs = gpsObs.filter(o => o.id === id).length;
+    const t = document.createElement('div'); t.className = 't';
+    t.textContent = id.slice(0,10) + '…' + (nObs ? ` · ${nObs} mesures GPS` : '');
     left.append(n,t);
-    const r = document.createElement('span'); r.className = 'r'; r.textContent = Math.round(avg(d)) + ' dBm';
+    const r = document.createElement('span'); r.className = 'r';
+    r.textContent = fresh(d) && d.samples.length ? Math.round(avg(d)) + ' dBm' : (d.last ? `vu il y a ${ago(now - d.last)}` : 'pas encore revu');
     li.append(left, r);
-    li.onclick = () => { selected = id; history = []; updateGauge(d); renderList(); drawTri(); };
+    li.onclick = () => { selected = id; history = []; updateGauge(d); renderList(); drawTri(); drawMap(); };
     ul.append(li);
   });
-  if (selected && !arr.some(([id]) => id === selected) && devices.get(selected) && now - devices.get(selected).last > 10000){
-    $('verdict').textContent = 'Signal perdu'; $('verdict').style.color = 'var(--cold)';
+  const sd = selected && devices.get(selected);
+  if (sd && !fresh(sd)){
+    $('verdict').textContent = sd.last ? `Hors de portée depuis ${ago(now - sd.last)}` : 'Pas encore revu';
+    $('verdict').style.color = 'var(--cold)';
   }
 }
+const ago = ms => ms < 60000 ? Math.round(ms/1000) + ' s' : Math.round(ms/60000) + ' min';
 setInterval(renderList, 1000);
+
+/* ---- Écran allumé et reprise ---- */
+let wakeLock = null;
+async function keepAwake(){
+  try{ if ('wakeLock' in navigator && document.visibilityState === 'visible') wakeLock = await navigator.wakeLock.request('screen'); }catch(e){}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') { save(); return; }
+  if (scan){ keepAwake();
+    if (scan.active === false){
+      scan = null; $('start').hidden = false; $('stop').hidden = true;
+      showMsg('Le scan s\u2019est arrêté (écran éteint ou appli quittée). Touche « Démarrer le scan » pour reprendre : toutes les mesures déjà récoltées sont conservées.');
+    }
+  }
+});
+
+/* ---- Sauvegarde dans le téléphone (survit à un rechargement de la page) ---- */
+const SAVE_KEY = 'radar-airpod-v1';
+function save(){
+  try{
+    localStorage.setItem(SAVE_KEY, JSON.stringify({
+      dev: [...devices.entries()].map(([id,d]) => [id, {name:d.name, apple:d.apple, last:d.last}]),
+      gpsObs, gpsOrigin, st: tri.st, me2, selected
+    }));
+  }catch(e){}
+}
+function load(){
+  try{
+    const o = JSON.parse(localStorage.getItem(SAVE_KEY) || 'null'); if (!o) return;
+    o.dev.forEach(([id,d]) => devices.set(id, {name:d.name||'', apple:!!d.apple, last:d.last||0, samples:[]}));
+    gpsObs = o.gpsObs || []; gpsOrigin = o.gpsOrigin || null;
+    tri.st = o.st || []; me2 = o.me2 || {x:0,y:0}; selected = o.selected || null;
+    if (gpsObs.length) fitAll();
+    if (tri.st.length >= 2) solveTri();
+    if (tri.st.length) $('triRot').textContent = `Tour au point ${tri.st.length+1}`;
+    if (gpsObs.length || tri.st.length)
+      showMsg(`Session précédente reprise : ${devices.size} appareils, ${gpsObs.length} mesures GPS, ${tri.st.length} points de triangulation. Touche « Tout effacer » pour repartir de zéro.`);
+  }catch(e){}
+}
+setInterval(save, 5000);
 
 /* ---- Triangulation : boussole (direction) + accéléromètre (pas), N points de mesure ---- */
 const STEP = 0.7;            // longueur moyenne d'un pas (m)
@@ -430,7 +480,7 @@ $('gpsStart').onclick = () => {
   $('gpsStart').textContent = 'Arrêter l’enregistrement';
   $('gpsInfo').textContent = 'Attente du GPS…';
 };
-$('gpsClear').onclick = () => { gpsObs = []; gpsOrigin = null; gpsEst = {}; drawMap(); };
+$('gpsClear').onclick = () => { gpsObs = []; gpsOrigin = null; gpsEst = {}; drawMap(); save(); };
 
 function onPos(p){
   here = {lat:p.coords.latitude, lon:p.coords.longitude, acc:p.coords.accuracy};
@@ -521,6 +571,13 @@ function drawMap(){
     : `Appareil estimé à ~${Math.round(dist)} m vers le ${dirName(bearing)} (±${Math.round(E.rad)} m, ${E.n} mesures). GPS ±${Math.round(here.acc)} m.`;
 }
 
+$('wipe').onclick = () => {
+  try{ localStorage.removeItem(SAVE_KEY); }catch(e){}
+  devices.clear(); gpsObs = []; gpsOrigin = null; gpsEst = {}; selected = null; history = [];
+  $('triReset').onclick(); $('msg').hidden = true; renderList(); drawMap();
+  $('rssi').textContent = '--'; $('verdict').textContent = 'Choisis un appareil'; $('verdict').style.color = '';
+};
+load(); renderList(); drawTri(); drawMap();
 </script>
 </body>
 </html>
