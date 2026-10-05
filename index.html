@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Radar AirPod</title>
+<style>
+/* Layout : un écran unique, gros chiffre RSSI en haut, liste des appareils Apple dessous */
+:root{
+  --bg:#eef2f3; --fg:#14211f; --muted:#5b6b68; --line:#cfd8d7; --card:#ffffff;
+  --hot:#d6452b; --warm:#e09b2d; --cold:#2f7fb5; --accent:#0f7a6a;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#0f1716; --fg:#e4eceb; --muted:#93a4a1; --line:#26332f; --card:#16211f;
+    --hot:#ff6a4d; --warm:#f2b347; --cold:#5aa9df; --accent:#3cc4ad; color-scheme: dark; }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:15px;
+  padding:max(16px,env(safe-area-inset-top)) 16px max(16px,env(safe-area-inset-bottom))}
+main{max-width:520px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+h1{font-size:20px;margin:0}
+.sub{color:var(--muted);margin:0;font-size:13px}
+button{font:inherit;font-weight:600;border:0;border-radius:10px;padding:14px 16px;
+  background:var(--accent);color:#fff;cursor:pointer;width:100%}
+button.secondary{background:transparent;color:var(--fg);border:1px solid var(--line)}
+button:focus-visible{outline:3px solid var(--warm);outline-offset:2px}
+.row{display:flex;gap:10px}
+.gauge{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;text-align:center}
+.big{font-family:var(--mono);font-size:64px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.unit{font-size:18px;color:var(--muted)}
+.verdict{font-size:22px;font-weight:700;margin-top:6px}
+.bar{height:14px;border-radius:7px;background:var(--line);overflow:hidden;margin-top:14px}
+.bar>i{display:block;height:100%;width:0;background:var(--cold);transition:width .3s,background .3s}
+.scale{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:4px}
+canvas{width:100%;height:90px;display:block;margin-top:12px}
+ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+li{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;
+  display:flex;justify-content:space-between;align-items:center;gap:10px;cursor:pointer}
+li.sel{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent) inset}
+li .n{font-weight:600;min-width:0;overflow-wrap:anywhere}
+li .t{font-size:12px;color:var(--muted)}
+li .r{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+.tag{font-size:11px;font-weight:700;padding:2px 6px;border-radius:6px;background:var(--accent);color:#fff;margin-left:6px}
+.msg{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--warm);border-radius:10px;padding:12px;font-size:14px}
+.msg code{font-family:var(--mono);font-size:12px;overflow-wrap:anywhere}
+label{display:flex;gap:8px;align-items:center;font-size:14px}
+details{font-size:14px;color:var(--muted)}
+details p{margin:.5em 0}
+@media (prefers-reduced-motion:reduce){.bar>i{transition:none}}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Radar AirPod</h1>
+    <p class="sub">Scan Bluetooth, choisis l'appareil, puis marche lentement : plus le chiffre monte (vers 0), plus tu es proche.</p>
+  </header>
+
+  <div id="msg" class="msg" hidden></div>
+
+  <div class="row">
+    <button id="start">Démarrer le scan</button>
+    <button id="stop" class="secondary" hidden>Arrêter</button>
+  </div>
+
+  <section class="gauge" aria-live="polite">
+    <div><span class="big" id="rssi">--</span> <span class="unit">dBm</span></div>
+    <div class="verdict" id="verdict">Choisis un appareil</div>
+    <div class="bar"><i id="fill"></i></div>
+    <div class="scale"><span>-100 loin</span><span>-70</span><span>-50</span><span>-30 tout près</span></div>
+    <canvas id="graph" aria-label="Historique du signal"></canvas>
+  </section>
+
+  <section class="gauge" id="triBox">
+    <div class="verdict" style="font-size:18px;color:var(--fg)">Triangulation (boussole + pas)</div>
+    <p class="sub" id="triStep" style="margin:8px 0">Choisis un appareil dans la liste, puis appuie sur « Tour au point A ».</p>
+    <div class="row">
+      <button id="triA">Tour au point A</button>
+      <button id="triB" class="secondary" disabled>Tour au point B</button>
+    </div>
+    <label style="justify-content:center;margin-top:10px">Distance A→B :
+      <input id="triDist" type="number" min="1" step="0.5" value="0" style="width:70px;font:inherit"> m
+      <span class="t" id="triSteps"></span></label>
+    <div class="big" id="triOut" style="font-size:30px;margin-top:12px">--</div>
+    <canvas id="triMap" style="height:260px" aria-label="Schéma de triangulation"></canvas>
+    <button id="triReset" class="secondary" style="margin-top:8px">Recommencer</button>
+  </section>
+
+  <section class="gauge" id="mapBox">
+    <div class="row">
+      <button id="gpsStart" class="secondary">Carte extérieure : enregistrer</button>
+      <button id="gpsClear" class="secondary">Effacer</button>
+    </div>
+    <div class="verdict" id="gpsInfo" style="font-size:16px">Sélectionne un appareil, puis marche en zigzag dehors.</div>
+    <canvas id="map" style="height:300px" aria-label="Carte du parcours colorée par force du signal"></canvas>
+    <div class="scale"><span>● bleu = faible</span><span>● rouge = fort</span><span>★ = meilleur point</span></div>
+  </section>
+
+  <div class="row">
+    <label><input type="checkbox" id="appleOnly"> Seulement les appareils Apple</label>
+    <label><input type="checkbox" id="beep"> Bip</label>
+  </div>
+
+  <ul id="list"></ul>
+
+  <details>
+    <summary>Comment ça marche et limites</summary>
+    <p>Le chiffre affiché est une moyenne des 5 dernières mesures, car le signal Bluetooth fluctue beaucoup (murs, corps, orientation du téléphone).</p>
+    <p>Les appareils Apple sont reconnus par leur identifiant fabricant Bluetooth (0x004C). Le nom « AirPods » n'est souvent pas diffusé.</p>
+    <p>Pour repérer l'écouteur perdu : scanne d'abord avec l'étui fermé loin de toi, puis repère l'appareil Apple qui reste quand tu t'éloignes de l'étui.</p>
+    <p>Un écouteur rangé ou en veille peut ne rien émettre. Rien à l'écran ne prouve donc pas qu'il est loin.</p>
+  </details>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const devices = new Map(); // id -> {name, apple, samples:[], last}
+let selected = null, scan = null, history = [], audioCtx = null, lastBeep = 0;
+
+function showMsg(html){ $('msg').innerHTML = html; $('msg').hidden = false; }
+
+function checkSupport(){
+  if (!window.isSecureContext){
+    showMsg("Cette page doit être ouverte en <b>https</b> (ou en local). Ouverte autrement, Chrome bloque le Bluetooth.");
+    return false;
+  }
+  if (!navigator.bluetooth){
+    showMsg("Ce navigateur n'a pas de Bluetooth web. Utilise <b>Chrome sur Android</b>.");
+    return false;
+  }
+  if (!navigator.bluetooth.requestLEScan){
+    showMsg("Le scan Bluetooth est une fonction expérimentale de Chrome. Active-la :<br>1. Ouvre <code>chrome://flags/#enable-experimental-web-platform-features</code><br>2. Passe-la sur <b>Enabled</b><br>3. Redémarre Chrome et rouvre cette page.");
+    return false;
+  }
+  return true;
+}
+
+$('start').onclick = async () => {
+  if (!checkSupport()) return;
+  try{
+    scan = await navigator.bluetooth.requestLEScan({acceptAllAdvertisements:true, keepRepeatedDevices:true});
+    navigator.bluetooth.addEventListener('advertisementreceived', onAdv);
+    $('msg').hidden = true; $('start').hidden = true; $('stop').hidden = false;
+    $('verdict').textContent = 'Scan en cours…';
+  }catch(e){
+    showMsg("Le scan n'a pas démarré : " + e.message + "<br>Vérifie que le Bluetooth et la localisation du téléphone sont activés, puis accepte la demande de Chrome.");
+  }
+};
+
+$('stop').onclick = () => {
+  if (scan) scan.stop();
+  navigator.bluetooth.removeEventListener('advertisementreceived', onAdv);
+  scan = null; $('start').hidden = false; $('stop').hidden = true;
+};
+
+function onAdv(ev){
+  const id = ev.device.id;
+  const apple = ev.manufacturerData && ev.manufacturerData.has(0x004C);
+  let d = devices.get(id);
+  if (!d){ d = {name: ev.device.name || ev.name || '', apple, samples:[]}; devices.set(id, d); }
+  if (apple) d.apple = true;
+  if (!d.name && (ev.device.name || ev.name)) d.name = ev.device.name || ev.name;
+  if (typeof ev.rssi === 'number'){
+    d.samples.push(ev.rssi); if (d.samples.length > 5) d.samples.shift();
+  }
+  d.last = Date.now();
+  if (id === selected) updateGauge(d);
+}
+
+const avg = d => d.samples.length ? d.samples.reduce((a,b)=>a+b,0)/d.samples.length : null;
+
+function updateGauge(d){
+  const v = avg(d); if (v === null) return;
+  $('rssi').textContent = Math.round(v);
+  const pct = Math.max(0, Math.min(100, (v + 100) / 70 * 100));
+  let label, color;
+  if (v > -50){ label = 'Tout près !'; color = 'var(--hot)'; }
+  else if (v > -70){ label = 'Tu chauffes'; color = 'var(--warm)'; }
+  else { label = 'Loin / froid'; color = 'var(--cold)'; }
+  $('verdict').textContent = label; $('verdict').style.color = color;
+  $('fill').style.width = pct + '%'; $('fill').style.background = color;
+  history.push(v); if (history.length > 120) history.shift();
+  drawGraph(); maybeBeep(v);
+}
+
+function drawGraph(){
+  const c = $('graph'), r = devicePixelRatio || 1;
+  c.width = c.clientWidth * r; c.height = c.clientHeight * r;
+  const g = c.getContext('2d'), w = c.width, h = c.height;
+  const css = getComputedStyle(document.documentElement);
+  g.clearRect(0,0,w,h);
+  g.strokeStyle = css.getPropertyValue('--line'); g.lineWidth = r;
+  [-50,-70].forEach(y => { const yy = h - (y+100)/70*h; g.beginPath(); g.moveTo(0,yy); g.lineTo(w,yy); g.stroke(); });
+  if (history.length < 2) return;
+  g.strokeStyle = css.getPropertyValue('--accent'); g.lineWidth = 2*r; g.beginPath();
+  history.forEach((v,i) => {
+    const x = i/(120-1)*w, y = h - Math.max(0,Math.min(1,(v+100)/70))*h;
+    i ? g.lineTo(x,y) : g.moveTo(x,y);
+  });
+  g.stroke();
+}
+
+function maybeBeep(v){
+  if (!$('beep').checked) return;
+  const gap = v > -50 ? 250 : v > -70 ? 700 : 1500, now = Date.now();
+  if (now - lastBeep < gap) return; lastBeep = now;
+  try{
+    audioCtx = audioCtx || new AudioContext();
+    const o = audioCtx.createOscillator(), gn = audioCtx.createGain();
+    o.frequency.value = 600 + (v+100)*8; gn.gain.value = 0.15;
+    o.connect(gn).connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime + 0.08);
+  }catch(e){}
+}
+
+function renderList(){
+  const now = Date.now(), appleOnly = $('appleOnly').checked;
+  const arr = [...devices.entries()]
+    .filter(([,d]) => now - d.last < 10000 && (!appleOnly || d.apple))
+    .sort((a,b) => (avg(b[1])??-200) - (avg(a[1])??-200));
+  const ul = $('list'); ul.innerHTML = '';
+  if (!arr.length && scan){
+    const li = document.createElement('li'); li.style.cursor = 'default';
+    li.innerHTML = '<span class="t">Aucun appareil détecté pour l’instant…</span>'; ul.append(li);
+  }
+  arr.forEach(([id,d]) => {
+    const li = document.createElement('li'); if (id === selected) li.classList.add('sel');
+    const left = document.createElement('div'); left.style.minWidth = '0';
+    const n = document.createElement('div'); n.className = 'n';
+    n.textContent = d.name || 'Appareil sans nom';
+    if (d.apple){ const t = document.createElement('span'); t.className='tag'; t.textContent='Apple'; n.append(t); }
+    const t = document.createElement('div'); t.className = 't'; t.textContent = id.slice(0,10) + '…';
+    left.append(n,t);
+    const r = document.createElement('span'); r.className = 'r'; r.textContent = Math.round(avg(d)) + ' dBm';
+    li.append(left, r);
+    li.onclick = () => { selected = id; history = []; updateGauge(d); renderList(); };
+    ul.append(li);
+  });
+  if (selected && !arr.some(([id]) => id === selected) && devices.get(selected) && now - devices.get(selected).last > 10000){
+    $('verdict').textContent = 'Signal perdu'; $('verdict').style.color = 'var(--cold)';
+  }
+}
+setInterval(renderList, 1000);
+
+/* ---- Triangulation : boussole (direction) + accéléromètre (pas) ---- */
+const STEP = 0.7;            // longueur moyenne d'un pas (m), modifiable via la distance saisie
+let heading = null;          // degrés, 0 = nord, sens horaire
+let tri = {phase:'idle'};    // idle | rotA | walk | rotB | done
+let me2 = {x:0,y:0}, walkSteps = 0, walkVec = {x:0,y:0}, lastStepT = 0, accHigh = false;
+
+function onOrient(e){
+  if (e.alpha == null) return;
+  heading = (360 - e.alpha) % 360;
+  if (tri.phase === 'rotA' || tri.phase === 'rotB') recordRot();
+  if (tri.phase === 'done') drawTri();
+}
+if ('ondeviceorientationabsolute' in window) addEventListener('deviceorientationabsolute', onOrient);
+else addEventListener('deviceorientation', e => { if (e.absolute) onOrient(e); });
+
+addEventListener('devicemotion', e => {
+  const a = e.accelerationIncludingGravity; if (!a || a.x == null) return;
+  const m = Math.hypot(a.x, a.y, a.z), t = Date.now();
+  if (!accHigh && m > 11.8 && t - lastStepT > 300){ accHigh = true; lastStepT = t; onStep(); }
+  if (m < 10.2) accHigh = false;
+});
+
+function onStep(){
+  if (heading == null || !(tri.phase === 'walk' || tri.phase === 'done')) return;
+  const dx = Math.sin(heading*Math.PI/180)*STEP, dy = Math.cos(heading*Math.PI/180)*STEP;
+  me2.x += dx; me2.y += dy;
+  if (tri.phase === 'walk'){
+    walkSteps++; walkVec.x += dx; walkVec.y += dy;
+    $('triDist').value = (Math.hypot(walkVec.x, walkVec.y)).toFixed(1);
+    $('triSteps').textContent = `(${walkSteps} pas)`;
+  }
+  if (tri.phase === 'done') drawTri();
+}
+
+function latestRssi(){
+  const d = selected && devices.get(selected);
+  return d && Date.now() - d.last < 1500 && d.samples.length ? d.samples[d.samples.length-1] : null;
+}
+
+function startRot(which){
+  if (!selected){ $('triStep').textContent = 'Choisis d’abord un appareil dans la liste.'; return; }
+  if (heading == null){ $('triStep').textContent = 'Boussole indisponible : bouge le téléphone en 8 pour la calibrer, puis réessaie.'; return; }
+  tri.rec = []; tri.turned = 0; tri.prevH = heading; tri.t0 = Date.now();
+  tri.phase = which === 'A' ? 'rotA' : 'rotB';
+  $('triStep').textContent = 'Téléphone à plat contre la poitrine, haut vers l’avant. Tourne lentement sur toi-même, un tour complet (~20 s).';
+}
+
+function recordRot(){
+  let dh = heading - tri.prevH; if (dh > 180) dh -= 360; if (dh < -180) dh += 360;
+  tri.turned += Math.abs(dh); tri.prevH = heading;
+  const v = latestRssi(); if (v != null) tri.rec.push({h:heading, v});
+  $('triOut').textContent = `${Math.round(Math.min(360, tri.turned))}° / 360°`;
+  if (tri.turned >= 340 || Date.now() - tri.t0 > 45000) finishRot();
+}
+
+function bearingFrom(rec){
+  const N = 24, sum = Array(N).fill(0), n = Array(N).fill(0);
+  rec.forEach(r => { const i = Math.floor(((r.h % 360)+360)%360 / 15); sum[i] += r.v; n[i]++; });
+  const m = sum.map((s,i) => n[i] ? s/n[i] : null);
+  const sm = m.map((_,i) => {
+    let a = 0, w = 0;
+    [[-1,1],[0,2],[1,1]].forEach(([k,wt]) => { const v = m[(i+k+N)%N]; if (v != null){ a += v*wt; w += wt; } });
+    return w ? a/w : null;
+  });
+  const valid = sm.filter(v => v != null);
+  if (valid.length < N*0.6) return null;
+  const best = sm.indexOf(Math.max(...valid));
+  return {deg: best*15 + 7.5, contrast: Math.max(...valid) - Math.min(...valid)};
+}
+
+function finishRot(){
+  const b = bearingFrom(tri.rec), which = tri.phase === 'rotA' ? 'A' : 'B';
+  if (!b){ tri.phase = which === 'A' ? 'idle' : 'walk';
+    $('triStep').textContent = 'Pas assez de mesures pendant le tour (signal trop intermittent). Recommence plus lentement.'; return; }
+  const weak = b.contrast < 5 ? ' Attention : écart de signal faible, direction peu sûre.' : '';
+  if (which === 'A'){
+    tri.A = {x:me2.x, y:me2.y, deg:b.deg};
+    walkSteps = 0; walkVec = {x:0,y:0}; $('triDist').value = 0; $('triSteps').textContent = '';
+    tri.phase = 'walk'; $('triB').disabled = false;
+    $('triOut').textContent = `A : vers le ${dirName(b.deg)}`;
+    $('triStep').textContent = `Marche 4 à 6 m de côté (perpendiculaire à cette direction), puis « Tour au point B ».${weak}`;
+  } else {
+    let vx = walkVec.x, vy = walkVec.y, L = Math.hypot(vx, vy);
+    const want = parseFloat($('triDist').value) || 0;
+    if (L < 0.1 && want > 0){ vx = Math.sin(heading*Math.PI/180); vy = Math.cos(heading*Math.PI/180); L = 1; }
+    const k = want > 0 ? want / L : 1;
+    me2 = {x: tri.A.x + vx*k, y: tri.A.y + vy*k};
+    tri.B = {x:me2.x, y:me2.y, deg:b.deg};
+    tri.phase = 'done'; tri.weak = weak;
+    solveTri();
+  }
+  drawTri();
+}
+
+function solveTri(){
+  const u = d => ({x:Math.sin(d*Math.PI/180), y:Math.cos(d*Math.PI/180)});
+  const cr = (a,b) => a.x*b.y - a.y*b.x;
+  const uA = u(tri.A.deg), uB = u(tri.B.deg), AB = {x:tri.B.x-tri.A.x, y:tri.B.y-tri.A.y};
+  const den = cr(uA, uB);
+  tri.P = null;
+  if (Math.abs(den) < Math.sin(15*Math.PI/180)){
+    $('triStep').textContent = 'Les deux directions sont presque parallèles : déplace-toi davantage sur le côté et refais le point B.'; return;
+  }
+  const t = cr(AB, uB)/den, s = cr(AB, uA)/den;
+  if (t < 0 || s < 0){
+    $('triStep').textContent = 'Les deux directions ne se croisent pas devant toi : une mesure est fausse. Refais le tour B (ou recommence).'; return;
+  }
+  tri.P = {x: tri.A.x + uA.x*t, y: tri.A.y + uA.y*t};
+  $('triStep').textContent = 'Position estimée calculée. Suis l’indication, elle se met à jour quand tu tournes et marches.' + tri.weak;
+}
+
+function drawTri(){
+  const out = $('triOut');
+  if (tri.phase === 'done' && tri.P && heading != null){
+    const dx = tri.P.x - me2.x, dy = tri.P.y - me2.y, h = heading*Math.PI/180;
+    const fwd = dx*Math.sin(h) + dy*Math.cos(h), right = dx*Math.cos(h) - dy*Math.sin(h);
+    const f = Math.round(Math.abs(fwd)), r = Math.round(Math.abs(right));
+    out.textContent = Math.hypot(dx,dy) < 1.5 ? 'Tu y es : chaud/froid !' :
+      `${f} m ${fwd >= 0 ? 'devant' : 'derrière'} · ${r} m à ${right >= 0 ? 'droite' : 'gauche'}`;
+  }
+  const c = $('triMap'), rr = devicePixelRatio || 1;
+  c.width = c.clientWidth*rr; c.height = c.clientHeight*rr;
+  const g = c.getContext('2d'), w = c.width, hh = c.height, css = getComputedStyle(document.documentElement);
+  g.clearRect(0,0,w,hh);
+  if (!tri.A) return;
+  const pts = [tri.A, me2]; if (tri.B) pts.push(tri.B); if (tri.P) pts.push(tri.P);
+  const xs = pts.map(p=>p.x), ys = pts.map(p=>p.y);
+  const span = Math.max(10, Math.max(...xs)-Math.min(...xs), Math.max(...ys)-Math.min(...ys))*1.3;
+  const cx = (Math.max(...xs)+Math.min(...xs))/2, cy = (Math.max(...ys)+Math.min(...ys))/2;
+  const s = Math.min(w,hh)/span, P = q => [w/2+(q.x-cx)*s, hh/2-(q.y-cy)*s];
+  const ray = (o, col) => { const [x,y] = P(o), L = span*s;
+    g.strokeStyle = col; g.lineWidth = 2*rr; g.setLineDash([6*rr,4*rr]); g.beginPath(); g.moveTo(x,y);
+    g.lineTo(x + Math.sin(o.deg*Math.PI/180)*L, y - Math.cos(o.deg*Math.PI/180)*L); g.stroke(); g.setLineDash([]); };
+  const dot = (o, col, label) => { const [x,y] = P(o); g.fillStyle = col; g.beginPath(); g.arc(x,y,6*rr,0,7); g.fill();
+    g.font = `${12*rr}px sans-serif`; g.fillText(label, x+9*rr, y-9*rr); };
+  ray(tri.A, css.getPropertyValue('--cold')); dot(tri.A, css.getPropertyValue('--cold'), 'A');
+  if (tri.B){ ray(tri.B, css.getPropertyValue('--warm')); dot(tri.B, css.getPropertyValue('--warm'), 'B'); }
+  if (tri.P) dot(tri.P, css.getPropertyValue('--hot'), 'AirPod ?');
+  dot(me2, css.getPropertyValue('--fg'), 'toi');
+  g.fillStyle = css.getPropertyValue('--muted'); g.font = `${11*rr}px monospace`; g.fillText('N ↑', w-36*rr, 16*rr);
+}
+
+$('triA').onclick = () => tri.phase === 'rotA' ? finishRot() : startRot('A');
+$('triB').onclick = () => tri.phase === 'rotB' ? finishRot() : startRot('B');
+$('triReset').onclick = () => { tri = {phase:'idle'}; me2 = {x:0,y:0}; walkSteps = 0; walkVec = {x:0,y:0};
+  $('triB').disabled = true; $('triOut').textContent = '--'; $('triDist').value = 0; $('triSteps').textContent = '';
+  $('triStep').textContent = 'Choisis un appareil dans la liste, puis appuie sur « Tour au point A ».'; drawTri(); };
+
+/* ---- Carte extérieure : GPS + signal ---- */
+let gpsWatch = null, here = null, pts = [];
+const toXY = (lat, lon, o) => ({
+  x: (lon - o.lon) * Math.cos(o.lat * Math.PI/180) * 111320,
+  y: (lat - o.lat) * 110540
+});
+const dirName = deg => ['nord','nord-est','est','sud-est','sud','sud-ouest','ouest','nord-ouest'][Math.round(((deg%360)+360)%360/45)%8];
+const sigColor = v => `hsl(${Math.round(210 - Math.max(0,Math.min(1,(v+100)/60))*210)} 80% 50%)`;
+
+$('gpsStart').onclick = () => {
+  if (gpsWatch !== null){
+    navigator.geolocation.clearWatch(gpsWatch); gpsWatch = null;
+    $('gpsStart').textContent = 'Carte extérieure : enregistrer'; return;
+  }
+  if (!navigator.geolocation){ $('gpsInfo').textContent = 'GPS indisponible dans ce navigateur.'; return; }
+  gpsWatch = navigator.geolocation.watchPosition(onPos,
+    e => { $('gpsInfo').textContent = 'GPS refusé ou indisponible : ' + e.message; },
+    {enableHighAccuracy:true, maximumAge:0, timeout:15000});
+  $('gpsStart').textContent = 'Arrêter l’enregistrement';
+  $('gpsInfo').textContent = 'Attente du GPS…';
+};
+$('gpsClear').onclick = () => { pts = []; drawMap(); };
+
+function onPos(p){
+  here = {lat:p.coords.latitude, lon:p.coords.longitude, acc:p.coords.accuracy};
+  const d = selected && devices.get(selected);
+  if (d && Date.now() - d.last < 3000 && d.samples.length){
+    pts.push({lat:here.lat, lon:here.lon, acc:here.acc, rssi:avg(d), dev:selected});
+  }
+  drawMap();
+}
+
+function drawMap(){
+  const c = $('map'), r = devicePixelRatio || 1;
+  c.width = c.clientWidth * r; c.height = c.clientHeight * r;
+  const g = c.getContext('2d'), w = c.width, h = c.height;
+  const css = getComputedStyle(document.documentElement);
+  g.clearRect(0,0,w,h);
+  const mine = pts.filter(p => p.dev === selected);
+  if (!selected){ $('gpsInfo').textContent = 'Sélectionne d’abord un appareil dans la liste.'; return; }
+  if (!mine.length || !here){
+    if (here) $('gpsInfo').textContent = `GPS ok (±${Math.round(here.acc)} m). Aucun signal de l’appareil choisi pour l’instant.`;
+    return;
+  }
+  const o = mine[0];
+  const all = mine.map(p => ({...toXY(p.lat,p.lon,o), v:p.rssi}));
+  const me = toXY(here.lat, here.lon, o);
+  const xs = all.map(p=>p.x).concat(me.x), ys = all.map(p=>p.y).concat(me.y);
+  let minX=Math.min(...xs), maxX=Math.max(...xs), minY=Math.min(...ys), maxY=Math.max(...ys);
+  const span = Math.max(20, maxX-minX, maxY-minY), cx=(minX+maxX)/2, cy=(minY+maxY)/2, pad=24*r;
+  const s = (Math.min(w,h) - 2*pad) / span;
+  const P = q => [w/2 + (q.x-cx)*s, h/2 - (q.y-cy)*s];
+  // échelle 10 m
+  g.strokeStyle = css.getPropertyValue('--muted'); g.fillStyle = css.getPropertyValue('--muted');
+  g.lineWidth = 2*r; g.beginPath(); g.moveTo(pad, h-pad/2); g.lineTo(pad+10*s, h-pad/2); g.stroke();
+  g.font = `${11*r}px monospace`; g.fillText('10 m', pad, h-pad/2-4*r);
+  g.fillText('N ↑', w-pad*1.6, pad);
+  // points
+  all.forEach(p => { const [x,y]=P(p); g.fillStyle = sigColor(p.v); g.beginPath(); g.arc(x,y,5*r,0,7); g.fill(); });
+  // meilleur point = moyenne des 3 mesures les plus fortes
+  const top = [...all].sort((a,b)=>b.v-a.v).slice(0,3);
+  const best = {x: top.reduce((a,p)=>a+p.x,0)/top.length, y: top.reduce((a,p)=>a+p.y,0)/top.length, v: top[0].v};
+  const [bx,by] = P(best); g.fillStyle = css.getPropertyValue('--hot');
+  g.font = `${22*r}px sans-serif`; g.textAlign='center'; g.textBaseline='middle'; g.fillText('★', bx, by);
+  // moi
+  const [mx,my] = P(me); g.strokeStyle = css.getPropertyValue('--fg'); g.lineWidth = 3*r;
+  g.beginPath(); g.arc(mx,my,8*r,0,7); g.stroke();
+  g.textAlign='start'; g.textBaseline='alphabetic';
+  const dx = best.x-me.x, dy = best.y-me.y, dist = Math.hypot(dx,dy);
+  const bearing = Math.atan2(dx,dy)*180/Math.PI;
+  $('gpsInfo').textContent = dist < here.acc
+    ? `Tu es dans la zone du meilleur signal (${Math.round(best.v)} dBm). Fouille ici en mode chaud/froid. GPS ±${Math.round(here.acc)} m.`
+    : `Meilleur signal (${Math.round(best.v)} dBm) à ~${Math.round(dist)} m vers le ${dirName(bearing)}. GPS ±${Math.round(here.acc)} m, ${mine.length} mesures.`;
+}
+$('appleOnly').onchange = renderList;
+checkSupport();
+</script>
+</body>
+</html>
