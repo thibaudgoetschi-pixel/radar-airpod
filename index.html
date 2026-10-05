@@ -93,9 +93,9 @@ details p{margin:.5em 0}
       <button id="gpsStart" class="secondary">Carte extérieure : enregistrer</button>
       <button id="gpsClear" class="secondary">Effacer</button>
     </div>
-    <div class="verdict" id="gpsInfo" style="font-size:16px">Sélectionne un appareil, puis marche en zigzag dehors.</div>
+    <div class="verdict" id="gpsInfo" style="font-size:16px">Marche en zigzag dehors, autour de la zone. Tous les appareils sont localisés.</div>
     <canvas id="map" style="height:300px" aria-label="Carte du parcours colorée par force du signal"></canvas>
-    <div class="scale"><span>● bleu = faible</span><span>● rouge = fort</span><span>★ = meilleur point</span></div>
+    <div class="scale"><span>● bleu faible → rouge fort</span><span>★ + cercle = position estimée</span></div>
   </section>
 
   <div class="row">
@@ -409,8 +409,8 @@ $('triReset').onclick = () => { tri = {phase:'idle', st:[], P:{}}; me2 = {x:0,y:
   $('triRot').textContent = 'Tour au point 1'; $('triOut').textContent = '--'; $('triDist').value = 0; $('triSteps').textContent = '';
   $('triStep').textContent = 'Lance le scan, puis fais un tour sur toi-même à 3 points ou plus, autour de la zone suspecte.'; drawTri(); };
 
-/* ---- Carte extérieure : GPS + signal ---- */
-let gpsWatch = null, here = null, pts = [];
+/* ---- Carte extérieure : GPS + signal, tous les appareils, ajustement d'un modèle de propagation ---- */
+let gpsWatch = null, here = null, gpsObs = [], gpsOrigin = null, gpsEst = {}, lastFit = 0;
 const toXY = (lat, lon, o) => ({
   x: (lon - o.lon) * Math.cos(o.lat * Math.PI/180) * 111320,
   y: (lat - o.lat) * 110540
@@ -430,15 +430,53 @@ $('gpsStart').onclick = () => {
   $('gpsStart').textContent = 'Arrêter l’enregistrement';
   $('gpsInfo').textContent = 'Attente du GPS…';
 };
-$('gpsClear').onclick = () => { pts = []; drawMap(); };
+$('gpsClear').onclick = () => { gpsObs = []; gpsOrigin = null; gpsEst = {}; drawMap(); };
 
 function onPos(p){
   here = {lat:p.coords.latitude, lon:p.coords.longitude, acc:p.coords.accuracy};
-  const d = selected && devices.get(selected);
-  if (d && Date.now() - d.last < 3000 && d.samples.length){
-    pts.push({lat:here.lat, lon:here.lon, acc:here.acc, rssi:avg(d), dev:selected});
+  if (here.acc <= 15){                       // on ignore les positions trop imprécises
+    if (!gpsOrigin) gpsOrigin = {lat:here.lat, lon:here.lon};
+    const xy = toXY(here.lat, here.lon, gpsOrigin), now = Date.now();
+    devices.forEach((d, id) => {
+      if (now - d.last < 3000 && d.samples.length) gpsObs.push({id, x:xy.x, y:xy.y, acc:here.acc, v:avg(d)});
+    });
+    if (now - lastFit > 3000){ lastFit = now; fitAll(); }
   }
   drawMap();
+}
+
+// Pour chaque appareil : on cherche la position (grille de 1 m) qui explique le mieux les mesures
+// avec le modèle RSSI = P0 - 10·n·log10(distance), P0 et n ajustés par régression linéaire.
+function fitDevice(obs){
+  if (obs.length < 8) return null;
+  const xs = obs.map(o=>o.x), ys = obs.map(o=>o.y);
+  const spread = Math.hypot(Math.max(...xs)-Math.min(...xs), Math.max(...ys)-Math.min(...ys));
+  if (spread < 8) return null;                // pas assez de déplacement pour localiser
+  const m = 15, x0 = Math.min(...xs)-m, x1 = Math.max(...xs)+m, y0 = Math.min(...ys)-m, y1 = Math.max(...ys)+m;
+  const stepG = Math.max(1, Math.max(x1-x0, y1-y0)/80), grid = [];
+  const W = obs.map(o => 1/Math.max(3, o.acc));
+  for (let gx = x0; gx <= x1; gx += stepG) for (let gy = y0; gy <= y1; gy += stepG){
+    let sw=0, sl=0, sv=0, sll=0, slv=0;
+    obs.forEach((o,i) => { const L = Math.log10(Math.max(1, Math.hypot(o.x-gx, o.y-gy))), w = W[i];
+      sw+=w; sl+=w*L; sv+=w*o.v; sll+=w*L*L; slv+=w*L*o.v; });
+    const den = sw*sll - sl*sl; if (den <= 1e-9) continue;
+    let b = (sw*slv - sl*sv)/den;                       // pente = -10·n
+    b = Math.max(-40, Math.min(-15, b));                // n contraint entre 1,5 et 4 (plage physique usuelle)
+    const a = (sv - b*sl)/sw;
+    let sse = 0; obs.forEach((o,i) => { const L = Math.log10(Math.max(1, Math.hypot(o.x-gx, o.y-gy)));
+      const r = o.v - (a + b*L); sse += W[i]*r*r; });
+    grid.push({x:gx, y:gy, sse});
+  }
+  if (!grid.length) return null;
+  const best = grid.reduce((p,c) => c.sse < p.sse ? c : p);
+  // zone plausible : écart d'ajustement inférieur au seuil du χ² à 2 degrés de liberté (~95 %)
+  const zone = grid.filter(g => g.sse <= best.sse*(1 + 6/Math.max(1, obs.length-4)));
+  const rad = Math.max(stepG, Math.sqrt(zone.reduce((s,g) => s + (g.x-best.x)**2 + (g.y-best.y)**2, 0)/zone.length));
+  return {x:best.x, y:best.y, rad, n:obs.length};
+}
+function fitAll(){
+  const by = {}; gpsObs.forEach(o => (by[o.id] = by[o.id] || []).push(o));
+  gpsEst = {}; Object.entries(by).forEach(([id, obs]) => { const f = fitDevice(obs); if (f) gpsEst[id] = f; });
 }
 
 function drawMap(){
@@ -447,44 +485,42 @@ function drawMap(){
   const g = c.getContext('2d'), w = c.width, h = c.height;
   const css = getComputedStyle(document.documentElement);
   g.clearRect(0,0,w,h);
-  const mine = pts.filter(p => p.dev === selected);
-  if (!selected){ $('gpsInfo').textContent = 'Sélectionne d’abord un appareil dans la liste.'; return; }
-  if (!mine.length || !here){
-    if (here) $('gpsInfo').textContent = `GPS ok (±${Math.round(here.acc)} m). Aucun signal de l’appareil choisi pour l’instant.`;
-    return;
-  }
-  const o = mine[0];
-  const all = mine.map(p => ({...toXY(p.lat,p.lon,o), v:p.rssi}));
-  const me = toXY(here.lat, here.lon, o);
-  const xs = all.map(p=>p.x).concat(me.x), ys = all.map(p=>p.y).concat(me.y);
-  let minX=Math.min(...xs), maxX=Math.max(...xs), minY=Math.min(...ys), maxY=Math.max(...ys);
-  const span = Math.max(20, maxX-minX, maxY-minY), cx=(minX+maxX)/2, cy=(minY+maxY)/2, pad=24*r;
-  const s = (Math.min(w,h) - 2*pad) / span;
-  const P = q => [w/2 + (q.x-cx)*s, h/2 - (q.y-cy)*s];
-  // échelle 10 m
+  if (!here){ return; }
+  if (!gpsOrigin){ $('gpsInfo').textContent = `GPS trop imprécis pour l’instant (±${Math.round(here.acc)} m, il faut ≤ 15 m). Va à découvert.`; return; }
+  const me = toXY(here.lat, here.lon, gpsOrigin);
+  const mine = gpsObs.filter(o => o.id === selected);
+  const ests = Object.entries(gpsEst);
+  const pts = [me, ...gpsObs, ...ests.map(e=>e[1])];
+  const xs = pts.map(p=>p.x), ys = pts.map(p=>p.y);
+  const span = Math.max(20, Math.max(...xs)-Math.min(...xs), Math.max(...ys)-Math.min(...ys))*1.15;
+  const cx=(Math.max(...xs)+Math.min(...xs))/2, cy=(Math.max(...ys)+Math.min(...ys))/2, pad=16*r;
+  const s = (Math.min(w,h) - 2*pad) / span, P = q => [w/2 + (q.x-cx)*s, h/2 - (q.y-cy)*s];
+  // échelle 10 m + nord
   g.strokeStyle = css.getPropertyValue('--muted'); g.fillStyle = css.getPropertyValue('--muted');
   g.lineWidth = 2*r; g.beginPath(); g.moveTo(pad, h-pad/2); g.lineTo(pad+10*s, h-pad/2); g.stroke();
-  g.font = `${11*r}px monospace`; g.fillText('10 m', pad, h-pad/2-4*r);
-  g.fillText('N ↑', w-pad*1.6, pad);
-  // points
-  all.forEach(p => { const [x,y]=P(p); g.fillStyle = sigColor(p.v); g.beginPath(); g.arc(x,y,5*r,0,7); g.fill(); });
-  // meilleur point = moyenne des 3 mesures les plus fortes
-  const top = [...all].sort((a,b)=>b.v-a.v).slice(0,3);
-  const best = {x: top.reduce((a,p)=>a+p.x,0)/top.length, y: top.reduce((a,p)=>a+p.y,0)/top.length, v: top[0].v};
-  const [bx,by] = P(best); g.fillStyle = css.getPropertyValue('--hot');
-  g.font = `${22*r}px sans-serif`; g.textAlign='center'; g.textBaseline='middle'; g.fillText('★', bx, by);
-  // moi
+  g.font = `${11*r}px monospace`; g.fillText('10 m', pad, h-pad/2-4*r); g.fillText('N ↑', w-pad*2.2, pad+4*r);
+  // mesures de l'appareil choisi, colorées par force du signal
+  mine.forEach(p => { const [x,y]=P(p); g.fillStyle = sigColor(p.v); g.beginPath(); g.arc(x,y,4*r,0,7); g.fill(); });
+  // estimations de tous les appareils
+  ests.forEach(([id,e]) => { if (id === selected) return; const [x,y]=P(e);
+    g.globalAlpha = e.rad > 10 ? 0.4 : 1; g.fillStyle = css.getPropertyValue('--muted');
+    g.beginPath(); g.arc(x,y,4*r,0,7); g.fill(); g.font = `${11*r}px sans-serif`; g.fillText(shortName(id), x+7*r, y-7*r); g.globalAlpha = 1; });
+  const E = selected && gpsEst[selected];
+  if (E){ const [x,y]=P(E); g.strokeStyle = css.getPropertyValue('--hot'); g.lineWidth = 1.5*r;
+    g.beginPath(); g.arc(x,y,Math.max(5*r, E.rad*s),0,7); g.stroke();
+    g.fillStyle = css.getPropertyValue('--hot'); g.font = `${22*r}px sans-serif`; g.textAlign='center'; g.textBaseline='middle';
+    g.fillText('★', x, y); g.textAlign='start'; g.textBaseline='alphabetic'; }
   const [mx,my] = P(me); g.strokeStyle = css.getPropertyValue('--fg'); g.lineWidth = 3*r;
-  g.beginPath(); g.arc(mx,my,8*r,0,7); g.stroke();
-  g.textAlign='start'; g.textBaseline='alphabetic';
-  const dx = best.x-me.x, dy = best.y-me.y, dist = Math.hypot(dx,dy);
-  const bearing = Math.atan2(dx,dy)*180/Math.PI;
-  $('gpsInfo').textContent = dist < here.acc
-    ? `Tu es dans la zone du meilleur signal (${Math.round(best.v)} dBm). Fouille ici en mode chaud/froid. GPS ±${Math.round(here.acc)} m.`
-    : `Meilleur signal (${Math.round(best.v)} dBm) à ~${Math.round(dist)} m vers le ${dirName(bearing)}. GPS ±${Math.round(here.acc)} m, ${mine.length} mesures.`;
+  g.beginPath(); g.arc(mx,my,7*r,0,7); g.stroke();
+  const nEst = ests.length;
+  if (!selected){ $('gpsInfo').textContent = `${gpsObs.length} mesures, ${nEst} appareil${nEst>1?'s':''} localisé${nEst>1?'s':''}. Touche un appareil dans la liste pour être guidé.`; return; }
+  if (!E){ $('gpsInfo').textContent = `${mine.length} mesures pour cet appareil. Il en faut au moins 8, réparties sur plus de 8 m : continue à marcher en zigzag autour de la zone. GPS ±${Math.round(here.acc)} m.`; return; }
+  const dx = E.x-me.x, dy = E.y-me.y, dist = Math.hypot(dx,dy), bearing = Math.atan2(dx,dy)*180/Math.PI;
+  $('gpsInfo').textContent = dist < Math.max(E.rad, here.acc)
+    ? `Tu es dans la zone estimée (±${Math.round(E.rad)} m). Fouille ici en mode chaud/froid. GPS ±${Math.round(here.acc)} m.`
+    : `Appareil estimé à ~${Math.round(dist)} m vers le ${dirName(bearing)} (±${Math.round(E.rad)} m, ${E.n} mesures). GPS ±${Math.round(here.acc)} m.`;
 }
-$('appleOnly').onchange = renderList;
-checkSupport();
+
 </script>
 </body>
 </html>
